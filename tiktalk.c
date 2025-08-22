@@ -235,21 +235,32 @@ void nonblocking_echo_server_select() {
 // ============================================================================
 void broadcast_message(client_t clients[], int sender_idx, const char* message) {
     char broadcast_msg[BUFFER_SIZE + MAX_NAME_LEN + 10];
+    int msg_len;
     
     // Format message with sender's name
     if (sender_idx >= 0) {
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "[%s]: %s", 
-                 clients[sender_idx].name, message);
+        msg_len = snprintf(broadcast_msg, sizeof(broadcast_msg), "[%s]: %s\n", 
+                          clients[sender_idx].name, message);
     } else {
-        strncpy(broadcast_msg, message, sizeof(broadcast_msg) - 1);
-        broadcast_msg[sizeof(broadcast_msg) - 1] = '\0';
+        // System messages (join/leave notifications)
+        msg_len = snprintf(broadcast_msg, sizeof(broadcast_msg), "%s", message);
     }
+    
+    // Ensure we don't exceed buffer size
+    if (msg_len >= sizeof(broadcast_msg)) {
+        msg_len = sizeof(broadcast_msg) - 1;
+        broadcast_msg[msg_len] = '\0';
+    }
+    
+    printf("Broadcasting: %s", broadcast_msg); // Debug output
     
     // Send to all active clients except sender
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active && i != sender_idx) {
-            if (send(clients[i].socket, broadcast_msg, strlen(broadcast_msg), 0) < 0) {
+            if (send(clients[i].socket, broadcast_msg, msg_len, 0) < 0) {
                 perror("broadcast send failed");
+                printf("Failed to send to client %s (socket %d)\n", 
+                       clients[i].name, clients[i].socket);
             }
         }
     }
@@ -362,6 +373,8 @@ void chat_server() {
         // Handle client messages
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && FD_ISSET(clients[i].socket, &read_fds)) {
+                // Clear buffer before reading
+                memset(buffer, 0, BUFFER_SIZE);
                 bytes_read = recv(clients[i].socket, buffer, BUFFER_SIZE - 1, 0);
                 
                 if (bytes_read <= 0) {
@@ -379,32 +392,63 @@ void chat_server() {
                     FD_CLR(clients[i].socket, &master_fds);
                     clients[i].active = 0;
                 } else {
+                    // Ensure null termination
                     buffer[bytes_read] = '\0';
                     
-                    // Remove newline if present
-                    if (buffer[bytes_read - 1] == '\n') {
+                    // Remove trailing newlines and carriage returns
+                    while (bytes_read > 0 && 
+                           (buffer[bytes_read - 1] == '\n' || buffer[bytes_read - 1] == '\r')) {
                         buffer[bytes_read - 1] = '\0';
+                        bytes_read--;
                     }
                     
-                    printf("Message from %s: %s\n", clients[i].name, buffer);
+                    // Skip empty messages
+                    if (strlen(buffer) == 0) {
+                        continue;
+                    }
+                    
+                    printf("Message from %s (socket %d): '%s'\n", clients[i].name, clients[i].socket, buffer);
                     
                     // Handle commands
                     if (strncmp(buffer, "/name ", 6) == 0) {
                         char old_name[MAX_NAME_LEN];
-                        strncpy(old_name, clients[i].name, MAX_NAME_LEN);
+                        strncpy(old_name, clients[i].name, MAX_NAME_LEN - 1);
+                        old_name[MAX_NAME_LEN - 1] = '\0';
                         
-                        strncpy(clients[i].name, buffer + 6, MAX_NAME_LEN - 1);
-                        clients[i].name[MAX_NAME_LEN - 1] = '\0';
+                        // Extract new name (skip "/name ")
+                        char *new_name = buffer + 6;
+                        // Remove any leading/trailing spaces
+                        while (*new_name == ' ') new_name++;
                         
-                        char name_change_msg[BUFFER_SIZE];
-                        snprintf(name_change_msg, sizeof(name_change_msg), 
-                                "*** %s is now known as %s ***\n", 
-                                old_name, clients[i].name);
-                        broadcast_message(clients, -1, name_change_msg);
-                        
-                        snprintf(name_change_msg, sizeof(name_change_msg), 
-                                "Your name has been changed to: %s\n", clients[i].name);
-                        send(clients[i].socket, name_change_msg, strlen(name_change_msg), 0);
+                        if (strlen(new_name) > 0) {
+                            strncpy(clients[i].name, new_name, MAX_NAME_LEN - 1);
+                            clients[i].name[MAX_NAME_LEN - 1] = '\0';
+                            
+                            char name_change_msg[BUFFER_SIZE];
+                            snprintf(name_change_msg, sizeof(name_change_msg), 
+                                    "*** %s is now known as %s ***\n", 
+                                    old_name, clients[i].name);
+                            broadcast_message(clients, -1, name_change_msg);
+                            
+                            snprintf(name_change_msg, sizeof(name_change_msg), 
+                                    "Your name has been changed to: %s\n", clients[i].name);
+                            send(clients[i].socket, name_change_msg, strlen(name_change_msg), 0);
+                        } else {
+                            char error_msg[] = "Error: Name cannot be empty\n";
+                            send(clients[i].socket, error_msg, strlen(error_msg), 0);
+                        }
+                    } else if (strncmp(buffer, "/help", 5) == 0) {
+                        char help_msg[] = "Available commands:\n"
+                                         "/name <newname> - Change your name\n"
+                                         "/help - Show this help message\n"
+                                         "-----------------------------\n"
+                                         "'^]' - Telnet commands:\n"
+                                         "'close' - Close the connection\n"
+                                         "'exit' - To exit\n"
+                                         "'help' - to see telnet commands\n"
+                                         "-----------------------------\n"
+                                         "Just type to chat with others!\n";
+                        send(clients[i].socket, help_msg, strlen(help_msg), 0);
                     } else {
                         // Broadcast regular message to all other clients
                         broadcast_message(clients, i, buffer);
