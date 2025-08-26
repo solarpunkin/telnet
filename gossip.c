@@ -1,45 +1,46 @@
 // ============================================================================
 // SIMPLE CHAT SERVER (Multi-client with messaging)
 // ============================================================================
-#include <stdio.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include <stdio.h>      // Standard I/O functions (printf, scanf, etc.)
+#include <stdlib.h>     // Standard library (exit, malloc, etc.)
+#include <string.h>     // String functions (memset, strncpy, strlen, etc.)
+#include <unistd.h>     // UNIX standard functions (close, read, write)
+#include <sys/socket.h> // Socket functions (socket, bind, listen, accept, send, recv)
+#include <sys/select.h> // select() function for I/O multiplexing
+#include <netinet/in.h> // Internet address family (sockaddr_in, INADDR_ANY)
+#include <arpa/inet.h>  // Internet operations (inet_ntoa for IP conversion)
+#include <errno.h>      // Error number definitions
+#include <fcntl.h>      // File control options
 
-#define PORT 8080
-#define BUFFER_SIZE 1024
-#define MAX_NAME_LEN 32
-#define MAX_CLIENTS 10
+#define PORT 8080        // Server will listen on port 8080
+#define MAX_CLIENTS 10   // Maximum number of simultaneous clients
+#define BUFFER_SIZE 1024 // Size of message buffers
+#define MAX_NAME_LEN 32  // Maximum length for client usernames
 
 // struct to hold client info for chat server
 
 typedef struct {
-    int socket;
-    char name[MAX_NAME_LEN];
-    int active;
+    int socket;                  // FD for client socket
+    char name[MAX_NAME_LEN];     // Client's username
+    int active;                  // 1 : connected, 0 : disconnected
 } client_t;
 
 void broadcast_message(client_t clients[], int sender_idx, const char* message) {
+    // Create buffer for formatted message (extra space for username and formatting)
     char broadcast_msg[BUFFER_SIZE + MAX_NAME_LEN + 10];
-    int msg_len;
+    int msg_len;        // actual message length
 
-    // Format message with sender's name
+    // Format message with sender's name as [Username]: message\n
     if (sender_idx >= 0) {
         msg_len = snprintf(broadcast_msg, sizeof(broadcast_msg), "[%s]: %s\n",
         clients[sender_idx].name, message);
     }
     else {
-        // System messages (join/leave notifications)
+        // System message (join/leave notifications)
         msg_len = snprintf(broadcast_msg, sizeof(broadcast_msg), "%s", message);
     }
 
-    // Buffer sanity check
+    // Buffer sanity check (if message is too long, truncate it and null-terminate)
     if (msg_len >= sizeof(broadcast_msg)) {
         msg_len = sizeof(broadcast_msg) - 1;
         broadcast_msg[msg_len] = '\0';
@@ -48,8 +49,9 @@ void broadcast_message(client_t clients[], int sender_idx, const char* message) 
     printf("Broadcasting: %s", broadcast_msg); // Debug output
 
     // Send to all active clients except sender
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && i != sender_idx) {
+    // Use send() system call to transmit data over socket
+    for (int i = 0; i < MAX_CLIENTS; i++) {             // Loop through all clients
+        if (clients[i].active && i != sender_idx) {     // Send message only to active clients who aren't the sender
             if (send(clients[i].socket, broadcast_msg, msg_len, 0) < 0) {
                 perror("broadcast send failed");
                 printf("Failed to send to client %s (socket %d)\n", clients[i].name, clients[i].socket);
@@ -59,36 +61,38 @@ void broadcast_message(client_t clients[], int sender_idx, const char* message) 
 }
 
 void chat_server() {
-    int server_fd, max_fd;
-    client_t clients[MAX_CLIENTS]; 
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    char buffer[BUFFER_SIZE];
-    fd_set read_fds, master_fds;
+    int server_fd, max_fd;              // FD for server and highest FD
+    client_t clients[MAX_CLIENTS];      // Array to store all client info
+    struct sockaddr_in server_addr, client_addr;        // Socket address structures
+    socklen_t client_len = sizeof(client_addr);         // Size of client address structure
+    char buffer[BUFFER_SIZE];                           // Buffer for receiving messages
+    fd_set read_fds, master_fds;                        // FD sets for select()
     int i, bytes_read, new_client;
 
     printf("Starting chat server on port %d...\n", PORT);
 
     // Initialize clients array
     for (i = 0; i < MAX_CLIENTS; i++) {
-        clients[i].socket = -1;
-        clients[i].active = 0;
-        memset(clients[i].name, 0, MAX_NAME_LEN);
+        clients[i].socket = -1;                         // -1 indicates unused slot
+        clients[i].active = 0;                          // mark as inactive
+        memset(clients[i].name, 0, MAX_NAME_LEN);       // clear name buffer 
     }
 
-    // Create and configure server socket
+    // Create and configure TCP server socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));     // Allow reusing the address 
+                                                                            // immediately after server restart
+                                                                            // Prevents "Address already in use" error
+    // Configure Server address
+    memset(&server_addr, 0, sizeof(server_addr));   
+    server_addr.sin_family = AF_INET;               // IPv4
+    server_addr.sin_addr.s_addr = INADDR_ANY;       // Accept connections from any IP
+    server_addr.sin_port = htons(PORT);             // Convert port from host to network byte order
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
@@ -101,21 +105,30 @@ void chat_server() {
 
     printf("Chat server listening on port %d\n", PORT);
     printf("Clients can connet and chat with each other!\n");
-
-    FD_ZERO(&master_fds);
-    FD_SET(server_fd, &master_fds);
-    max_fd = server_fd;
+    
+    // Initialize File Descriptor Sets
+    FD_ZERO(&master_fds);              // Clear the master set
+    FD_SET(server_fd, &master_fds);    // Add server socket to master set
+    max_fd = server_fd;                // Track highest file descriptor number
 
     while(1) {
-        read_fds = master_fds;
+        read_fds = master_fds;          // Copy master set (select() modifies the set)
 
         if (select(max_fd+1, &read_fds, NULL, NULL, NULL) < 0 ) {
             perror("select failed");
             break;
         }
+        /* 
+        select(): Monitor multiple file descriptors for activity
+        max_fd + 1: Number of file descriptors to monitor
+        &read_fds: Set of file descriptors to check for reading
+        NULL, NULL, NULL: We're not monitoring write, exception, or timeout
+        Returns when at least one file descriptor has data ready to read
+        */
+
 
         // HANDLE new connections
-        if (FD_ISSET(server_fd, &read_fds)) {
+        if (FD_ISSET(server_fd, &read_fds)) {       // FD_ISSET: Checks if server socket has activity
             new_client = accept (server_fd, (struct sockaddr*)&client_addr, &client_len);
             if (new_client < 0) {
                 perror("accept failed");
@@ -123,11 +136,13 @@ void chat_server() {
             else {
                 // Find empty slot for new client
                 for (i = 0; i < MAX_CLIENTS; i++) {
-                    if(!clients[i].active) {
-                        clients[i].socket = new_client;
-                        clients[i].active = 1;
-                        snprintf(clients[i].name, MAX_NAME_LEN, "User%d", new_client);
+                    if(!clients[i].active) {                // Find empty slot
+                        clients[i].socket = new_client;     // Store client socket
+                        clients[i].active = 1;              // Mark as active
+                        snprintf(clients[i].name, MAX_NAME_LEN, "User%d", new_client);  // Assign default username based on socket number
 
+                        // Add new client socket to the set that select() monitors
+                        // Update max_fd if this is the highest numbered file descriptor
                         FD_SET(new_client, &master_fds);
                         if (new_client > max_fd) {
                             max_fd = new_client;
@@ -151,7 +166,7 @@ void chat_server() {
                         char join_msg[BUFFER_SIZE];
                         snprintf(join_msg, sizeof(join_msg), "*** %s joined the chat ***\n",
                     clients[i].name);
-                    broadcast_message(clients, -1, join_msg);
+                    broadcast_message(clients, -1, join_msg);       // broadcast_message() with -1 means it's a system message
                     break;
                     }
                 }
@@ -164,13 +179,13 @@ void chat_server() {
 
         // Handle new clients
 
-        for (i = 0; i < MAX_CLIENTS; i++)
+        for (i = 0; i < MAX_CLIENTS; i++)           
         {
-            if (clients[i].active && FD_ISSET(clients[i].socket, &read_fds)) {
-                // Clear buffer before reading
-                memset(buffer, 0, BUFFER_SIZE);
+            if (clients[i].active && FD_ISSET(clients[i].socket, &read_fds)) {    // Check if client is active AND has data ready to read
+                // Clear buffer before reading to prevent corruption
+                memset(buffer, 0, BUFFER_SIZE);     
                 bytes_read = recv(clients[i].socket, buffer, BUFFER_SIZE - 1, 0);
-
+                // BUFFER_SIZE - 1 : Leave space for null terminator
                 if (bytes_read <= 0) {
                     // Client disconnected
                     printf("Client %s (socket %d) disconnected\n",
@@ -186,6 +201,8 @@ void chat_server() {
                 clients[i].active = 0;
                 }
                 else {
+                    /*Process Client Messages*/
+                    
                     // Ensure null termination
                     buffer[bytes_read] = '\0';
 
@@ -203,7 +220,7 @@ void chat_server() {
                     printf("Message from %s (socket %d): '%s'\n", clients[i].name, clients[i].socket, buffer);
 
                     // Handle commands
-                    if (strncmp(buffer, "/name ", 6) == 0) {
+                    if (strncmp(buffer, "/name ", 6) == 0) {        
                         char old_name[MAX_NAME_LEN];    
                         strncpy(old_name, clients[i].name, MAX_NAME_LEN - 1);
                         old_name[MAX_NAME_LEN - 1] = '\0';
@@ -214,12 +231,13 @@ void chat_server() {
                         while (*new_name == ' ') new_name++;
                         if (strlen(new_name) > 0) {
                             strncpy(clients[i].name, new_name, MAX_NAME_LEN - 1);
-                            clients[i].name[MAX_NAME_LEN - 1] = '\0';
+                            clients[i].name[MAX_NAME_LEN - 1] = '\0';       // Ensure null termination
 
                             char name_change_msg[BUFFER_SIZE];
                             snprintf(name_change_msg, sizeof(name_change_msg),
                         "*** %s is now known as %s ***\n",
-                    old_name, clients[i].name);
+                    old_name, clients[i].name);                             // Copy new name to client structure with bounds checking
+                    
                     broadcast_message(clients, -1, name_change_msg);
 
                     snprintf(name_change_msg, sizeof(name_change_msg),
