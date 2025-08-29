@@ -25,6 +25,20 @@ typedef struct {
     int active;                  // 1 : connected, 0 : disconnected
 } client_t;
 
+static int safe_send(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+    ssize_t n = send(fd, buf + sent, len - sent, 0);
+    if (n < 0) {
+    if (errno == EINTR) continue;
+    return -1; // error
+    }
+    if (n == 0) break; // connection closed
+    sent += (size_t)n;
+    }
+    return (int)sent;
+}
+
 void broadcast_message(client_t clients[], int sender_idx, const char* message) {
     // Create buffer for formatted message (extra space for username and formatting)
     char broadcast_msg[BUFFER_SIZE + MAX_NAME_LEN + 10];
@@ -51,7 +65,7 @@ void broadcast_message(client_t clients[], int sender_idx, const char* message) 
     // Use send() system call to transmit data over socket
     for (int i = 0; i < MAX_CLIENTS; i++) {             // Loop through all clients
         if (clients[i].active && i != sender_idx) {     // Send message only to active clients who aren't the sender
-            if (send(clients[i].socket, broadcast_msg, msg_len, 0) < 0) {
+            if (safe_send(clients[i].socket, broadcast_msg, (size_t)msg_len) < 0) {
                 perror("broadcast send failed");
                 printf("Failed to send to client %s (socket %d)\n", clients[i].name, clients[i].socket);
             }
@@ -134,6 +148,7 @@ void chat_server() {
             }
             else {
                 // Find empty slot for new client
+                int placed = 0;
                 for (i = 0; i < MAX_CLIENTS; i++) {
                     if(!clients[i].active) {                // Find empty slot
                         clients[i].socket = new_client;     // Store client socket
@@ -154,23 +169,27 @@ void chat_server() {
                         
                 // Send welcome message
                 char welcome[BUFFER_SIZE];
-                snprintf(welcome, sizeof(welcome),
+                int wl = snprintf(welcome, sizeof(welcome),
             "Welcome to the chat server! Your name is %s\n"
                                 "Commands: /name <newname> - change your name\n"
                                 "Type messages to chat with others!\n", 
                                 clients[i].name);
-                        send(new_client, welcome, strlen(welcome), 0);
+                                if (wl > 0)
+                        safe_send(new_client, welcome, (size_t)wl);
 
                         // Notify other clients
                         char join_msg[BUFFER_SIZE];
-                        snprintf(join_msg, sizeof(join_msg), "*** %s joined the chat ***\n",
+                        int jl = snprintf(join_msg, sizeof(join_msg), "*** %s joined the chat ***\n",
                     clients[i].name);
-                    broadcast_message(clients, -1, join_msg);       // broadcast_message() with -1 means it's a system message
-                    break;
+                    if (jl > 0) broadcast_message(clients, -1, join_msg);
+
+                        placed = 1;
+                        break;
                     }
                 }
-                if (i == MAX_CLIENTS) {
-                    printf("Maximum clients reached. Connection rejected.\n");
+                if (!placed) {
+                    const char *full = "Server full. Try again later.\n";
+                    safe_send(new_client, full, strlen(full));
                     close(new_client);
                 }
             }
@@ -219,7 +238,7 @@ void chat_server() {
                     printf("Message from %s (socket %d): '%s'\n", clients[i].name, clients[i].socket, buffer);
 
                     // Handle commands
-                    if (strncmp(buffer, " /name ", 6) == 0) {        
+                    if (strncmp(buffer, "/name ", 6) == 0) {        
                         char old_name[MAX_NAME_LEN];    
                         strncpy(old_name, clients[i].name, MAX_NAME_LEN - 1);
                         old_name[MAX_NAME_LEN - 1] = '\0';
@@ -233,15 +252,15 @@ void chat_server() {
                             clients[i].name[MAX_NAME_LEN - 1] = '\0';       // Ensure null termination
 
                             char name_change_msg[BUFFER_SIZE];
-                            snprintf(name_change_msg, sizeof(name_change_msg),
+                            int n1 = snprintf(name_change_msg, sizeof(name_change_msg),
                         "*** %s is now known as %s ***\n",
                     old_name, clients[i].name);                             // Copy new name to client structure with bounds checking
                     
-                    broadcast_message(clients, -1, name_change_msg);
+                    if (n1 > 0) broadcast_message(clients, -1, name_change_msg);
 
-                    snprintf(name_change_msg, sizeof(name_change_msg),
+                    n1 = snprintf(name_change_msg, sizeof(name_change_msg),
                 "Your name has been changed to: %s\n", clients[i].name);
-                send(clients[i].socket, name_change_msg, strlen(name_change_msg), 0);
+                if (n1 > 0) safe_send(clients[i].socket, name_change_msg, (size_t)n1);
                         }
                         else {
                             char error_msg[] = "Error: Name cannot be empty\n";
@@ -261,7 +280,7 @@ void chat_server() {
                                          "'help' - to see telnet commands\n"
                                          "-----------------------------\n"
                                          "Just type to chat with others!\n";
-                        send(clients[i].socket, help_msg, strlen(help_msg), 0);
+                        safe_send(clients[i].socket, help_msg, strlen(help_msg));
                     } else {
                         // Broadcast regular message to all other clients
                         broadcast_message(clients, i, buffer);
@@ -281,13 +300,12 @@ void chat_server() {
 }
 
 int main(int argc, char *argv[]) {
-    int choice = 1; // Default to chat server
-    
+    int choice = 1; // only chat server
     if (argc > 1) {
         choice = atoi(argv[1]);
     } else {
         printf("Chat Server\n");
-        scanf("%d", &choice);
+        if (scanf("%d", &choice) != 1) choice = 1;
     }
     switch (choice) {
         case 1:
@@ -297,6 +315,5 @@ int main(int argc, char *argv[]) {
             printf("Invalid choice.\n");
             break;
     }
-    
     return 0;
 }
