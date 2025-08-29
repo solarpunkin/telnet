@@ -220,7 +220,7 @@ void chat_server() {
                     printf("Message from %s (socket %d): '%s'\n", clients[i].name, clients[i].socket, buffer);
 
                     // Handle commands
-                    if (strncmp(buffer, "/name ", 6) == 0) {        
+                    if (strncmp(buffer, " /name ", 6) == 0) {        
                         char old_name[MAX_NAME_LEN];    
                         strncpy(old_name, clients[i].name, MAX_NAME_LEN - 1);
                         old_name[MAX_NAME_LEN - 1] = '\0';
