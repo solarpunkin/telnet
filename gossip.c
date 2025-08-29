@@ -41,11 +41,10 @@ void broadcast_message(client_t clients[], int sender_idx, const char* message) 
     }
 
     // Buffer sanity check (if message is too long, truncate it and null-terminate)
-    if (msg_len >= sizeof(broadcast_msg)) {
+    if (msg_len >= (int)sizeof(broadcast_msg)) {
         msg_len = sizeof(broadcast_msg) - 1;
         broadcast_msg[msg_len] = '\0';
     }
-
     printf("Broadcasting: %s", broadcast_msg); // Debug output
 
     // Send to all active clients except sender
@@ -202,7 +201,7 @@ void chat_server() {
                 }
                 else {
                     /*Process Client Messages*/
-                    
+
                     // Ensure null termination
                     buffer[bytes_read] = '\0';
 
@@ -251,7 +250,7 @@ void chat_server() {
                         }
 
                     }
-                    else if (strncpy(buffer, "/help", 5) == 0){
+                    else if (strncmp(buffer, "/help", 5) == 0){
                         char help_msg[] = "Available commands:\n"
                                          "/name <newname> - Change your name\n"
                                          "/help - Show this help message\n"

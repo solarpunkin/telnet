@@ -483,7 +483,6 @@ int main(int argc, char *argv[]) {
         printf("Enter choice (1-3): ");
         scanf("%d", &choice);
     }
-    
     switch (choice) {
         case 1:
             blocking_echo_server();
