@@ -1,3 +1,8 @@
+/* 
+-- Reads a files and computes crc32 over its contents
+-- sends file size, file data, and the crc32 digest to the receiver. 
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
