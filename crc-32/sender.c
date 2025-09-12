@@ -3,6 +3,7 @@
 -- sends file size, file data, and the crc32 digest to the receiver. 
 */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +12,21 @@
 #include "crc32.h"
 
 #define PORT 8080
-#define BUF_SIZE 1024
-
+#define BUF_SIZE 4096
+static ssize_t writen(int fd, const void *buf, size_t n) {
+    const unsigned char *p = buf;
+    size_t left = n;
+    while (left) {
+        ssize_t w = send(fd, p, left, 0);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += w;
+        left -= w;
+    }
+    return (ssize_t)n;
+}
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <server_ip> <file>\n", argv[0]);
@@ -21,10 +35,7 @@ int main(int argc, char *argv[]) {
 
     int sock = 0;
     struct sockaddr_in serv_addr;
-    char buffer[BUF_SIZE];
     FILE *fp;
-    size_t n;
-    uint32_t crc = 0;
 
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
@@ -52,24 +63,34 @@ int main(int argc, char *argv[]) {
 
     // Get file size
     fseek(fp, 0, SEEK_END);
-    long filesize = ftell(fp);
+    uint64_t filesize = ftell(fp);
     rewind(fp);
 
     // Send file size first
-    write(sock, &filesize, sizeof(filesize));
+    writen(sock, &filesize, sizeof(filesize));
 
     // Compute CRC32 before sending file
-    while ((n = fread(buffer, 1, BUF_SIZE, fp)) > 0) {
-        write(sock, buffer, n);
-        crc = xcrc32((unsigned char *)buffer, n, crc);
+    size_t n;
+    uint32_t crc = 0xFFFFFFFFu;
+    unsigned char buffer[BUF_SIZE];
+
+    while ((n = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        if (writen(sock, buffer, n) != (ssize_t)n) {
+            perror("Send failed");
+            fclose(fp);
+            close(sock);
+            exit(EXIT_FAILURE);
+        }
+        crc = xcrc32(buffer, (int)n, crc);
     }
     fclose(fp);
 
     // Send CRC32
-    write(sock, &crc, sizeof(crc));
+    uint32_t new_crc = htonl(crc);
+    writen(sock, &new_crc, sizeof(new_crc));
 
     printf("File sent successfully with CRC32: %08X\n", crc);
-
+    
     close(sock);
     return 0;
 }
