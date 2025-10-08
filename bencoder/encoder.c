@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "bencode_write.h"
+#include "encoder.h"
 
 struct benc_w {
     unsigned char *buf;
