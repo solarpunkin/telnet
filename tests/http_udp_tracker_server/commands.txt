@@ -1,0 +1,24 @@
+assuming files:
+
+bencode.c
+bencode.h
+encoder.c
+encoder.h
+tracker.c
+announce.py
+
+# create tracker server
+$ cc -O2 -std=c11 tracker.c encoder.c -o tracker -lpthread 
+$ ./tracker --udp-port 9000 --http-port 8080
+
+$ python3 announce.py
+
+# query peers over http; will output bencoded dict; use `xxd` or a small parser to inspect.
+$ curl "http://127.0.0.1:8080/peers?info_hash=0123456789abcdef0123456789abcdef01234567" --output -
+
+# verify benocde 
+$ cc -Wall -O2 -std=c11 bencode_parse.c bencode.c -o test_bencode
+$ ./test_bencode
+
+
+
