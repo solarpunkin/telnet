@@ -3,8 +3,10 @@
 // and truncating to 20 bytes for the handshake info_hash.
 // Reuses existing bencode parser to locate the exact bencoded "info" slice.
 // Build: cc -O2 -std=c11 handshake.c bencode.c -o handshake -lcrypto -lpthread
+// Build command works: cc -O2 -std=c11 handshake.c bencode.c -o handshake 
+// -I/opt/homebrew/opt/openssl@3/include -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto -lpthread
 //
-// Usage examples:
+// Usage:
 //   Server: ./handshake --mode server --port 6881 --torrent my.torrent --peer-id "-HS0001-1234567890"
 //   Client: ./handshake --mode client --connect 127.0.0.1:6881 --torrent my.torrent
 //
@@ -13,8 +15,7 @@
 // Both sides send handshake; each validates info_hash matches the local torrent's info_hash.
 // After successful handshake, peers are registered in an in-memory peer manager.
 //
-// Note: This intentionally computes SHA-256(info_bencoded) and truncates to 20 bytes
-// to use in the handshake. This is a purposeful deviation from classic spec (SHA-1).
+// We compute SHA-256(info_bencoded) and truncate to 20 bytes
 
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
@@ -34,8 +35,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "bencode.h"  // must exist in project
-
+#include "bencode.h"  
 /* ---------------- helpers: readn/writen ---------------- */
 static ssize_t readn(int fd, void *buf, size_t n) {
     unsigned char *p = buf;
