@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bencode.h"   // update the path
@@ -220,6 +221,35 @@ static void pm_add_or_update(peer_manager_t *pm, const unsigned char peer_id[20]
     fprintf(stderr, "[PM] added peer %s:%u id=%s\n", n->ip, n->port, pidhex);
 }
 
+// set state by peer_id
+static void pm_set_choke(peer_manager_t *pm, const unsigned char peer_id[20], int choke){
+    pthread_mutex_lock(&pm->lock);
+    peer_entry_t *p = pm->head;
+    while (p){
+        if (memcmp(p->peer_id, peer_id, 20) == 0){
+            p->choke = choke ? 1 : 0;
+            p->last_seen = time(NULL);
+            break;
+        }
+        p = p->next;
+    }
+    pthread_mutex_unlock(&pm->lock);
+}
+
+static void pm_set_interested(peer_manager_t *pm, const unsigned char peer_id[20], int interested){
+    pthread_mutex_lock(&pm->lock);
+    peer_entry_t *p = pm->head;
+    while (p){
+        if (memcmp(p->peer_id, peer_id, 20) == 0){
+            p->interested = interested ? 1 : 0;
+            p->last_seen = time(NULL);
+            break;
+        }
+        p = p->next;
+    }
+    pthread_mutex_unlock(&pm->lock);
+}
+
 static void pm_log_all(peer_manager_t *pm) {
     pthread_mutex_lock(&pm->lock);
     peer_entry_t *p = pm->head;
@@ -280,6 +310,55 @@ static int recv_handshake(int fd, unsigned char out_info_hash[20], unsigned char
     return 0;
 }
 
+/* ---------------- message framing and helpers ---------------- */
+
+static int send_keepalive(int fd){
+    uint32_t z = htonl(0);
+    return writen(fd, &z, 4) == 4 ? 0 : -1;
+}
+static int send_simple_msg(int fd, unsigned char id) {
+    uint32_t len = htonl(1);
+    unsigned char buf[5];
+    memcpy(buf, &len, 4);
+    buf[4] = id;
+    return writen(fd, buf, 5) == 5 ? 0 : -1;
+}
+
+static int send_choke(int fd){ return send_simple_msg(fd, 0); }
+static int send_unchoke(int fd){ return send_simple_msg(fd, 1); }
+static int send_interested(int fd){ return send_simple_msg(fd, 2); }
+static int send_not_interested(int fd){ return send_simple_msg(fd, 3); }
+// send have (id=4) with 4-byte piece index (b-endian)
+static int send_have(int fd, uint32_t index) {
+    uint32_t len = htonl(5);
+    unsigned char buf[9];
+    memcpy(buf, &len, 4);
+    buf[4] = 4;
+    memcpy(buf + 5, &index, 4);
+    return writen(fd, buf, 9) == 9 ? 0 : -1;
+}
+//send bitfield (id=5) with payload bytes
+static int send_bitfiled(int fd, const unsigned char *payload, size_t payload_len) {
+    if (payload_len > 0x7fffffff) return -1;
+    uint32_t plen = (uint32_t)(1 + payload_len);
+    uint32_t len = htonl(plen);
+    if (writen(fd, &len, 4) != 4) return -1;
+    unsigned char id = 5;
+    if (writen(fd, &id, 1) != 1) return -1;
+    if (writen(fd, payload, payload_len) != (ssize_t)payload_len) return -1;
+    return 0;
+}
+
+// skip payload
+static void skip_payload(int fd, uint32_t n) {
+    unsigned char tmp[4096];
+    while (n) {
+        size_t chunk = n > sizeof(tmp) ? sizeof(tmp) : n;
+        if (readn(fd, tmp, chunk) != (ssize_t)chunk) return;
+        n -= chunk;
+    }
+}
+
 /* ---------------- server code ---------------- */
 
 typedef struct {
@@ -289,6 +368,44 @@ typedef struct {
     unsigned char info_hash[20];
     unsigned char server_peer_id[20];
 } server_conn_ctx_t;
+
+// handle messages after handshake
+static void handle_incoming_message(int fd, unsigned char msg_id, uint32_t payload_len, unsigned char *peerid) {
+    (void)fd;
+    // payload_len is length excluding message id; caller must read payload or skip.
+    switch (msg_id) {
+        case 0: // choke
+            pm_set_choke(&PM, peerid, 1);
+            fprintf(stderr, "[server] got CHOKE from peer\n");
+            break;
+        case 1: // unchoke
+            pm_set_choke(&PM, peerid, 0);
+            fprintf(stderr, "[server] got UNCHOKE from peer\n");
+            break;
+        case 2: // interested
+            pm_set_interested(&PM, peerid, 1);
+            fprintf(stderr, "[server] got INTERESTED from peer\n");
+            break;
+        case 3: // not interested
+            pm_set_interested(&PM, peerid, 0);
+            fprintf(stderr, "[server] got NOT_INTERESTED from peer\n");
+            break;
+        case 4: { // have: payload 4 bytes piece index
+            if (payload_len != 4) {
+                fprintf(stderr, "[server] HAVE with wrong payload len %u\n", payload_len);
+                break;
+            }
+            // reading handled by caller
+            fprintf(stderr, "[server] got HAVE\n");
+            break;
+        }
+        case 5: // bitfield
+            fprintf(stderr, "[server] got BITFIELD len=%u\n", payload_len);
+            break;
+        default:
+            fprintf(stderr, "[server] got UNKNOWN id=%u len=%u\n", msg_id, payload_len);
+    }
+}
 
 static void *server_conn_thread(void *arg) {
     server_conn_ctx_t *ctx = arg;
@@ -336,8 +453,44 @@ static void *server_conn_thread(void *arg) {
 
     // keep the connection open for future messages (not implemented here).
     // For demo, sleep a little and close.
-    sleep(1);
+    // sleep(1);
 
+    // message loop
+    // read length(4), then if 0 keep-alive; else read id + payload
+    while (1) {
+        uint32_t len_be;
+        ssize_t r = readn(fd, &len_be, 4);
+        if (r != 4) break;
+        uint32_t len = ntohl(len_be);
+        if (len == 0) {
+            fprintf(stderr, "[server] keep-alive from peer\n");
+            continue;
+        }
+        // read id
+        unsigned char id;
+        if (readn(fd, &id, 1) != 1) break;
+        uint32_t payload_len = len - 1;
+        if (id == 4 && payload_len == 4) {
+            unsigned char idxbuf[4];
+            if (readn(fd, idxbuf, 4) != 4) break;
+            uint32_t idx = ntohl(*(uint32_t *)idxbuf);
+            fprintf(stderr, "[server] HAVE got HAVE index=%u\n", idx);
+            handle_incoming_message(fd, id, payload_len, remote_peerid);
+        } else if (id == 5) {
+            unsigned char *bf = malloc(payload_len ? payload_len : 1);
+            if (!bf) { skip_payload(fd, payload_len); continue; }
+            if (readn(fd, bf, payload_len) != (ssize_t)payload_len) { free(bf); break; }
+            fprintf(stderr, "[server] got BITFIELD len=%u\n", payload_len);
+            handle_incoming_message(fd, id, payload_len, remote_peerid);
+            free(bf);
+        } else {
+            if (payload_len) {
+                skip_payload(fd, payload_len);
+            }
+            handle_incoming_message(fd, id, payload_len, remote_peerid);
+        }
+    }
+    fprintf(stderr, "[server] connection closed for peer %s\n", pidhex);
     close(fd);
     free(ctx);
     return NULL;
@@ -441,6 +594,16 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
     fprintf(stderr, "[client] handshake success to %s:%u peerid=%s\n", ipbuf, portn, pidhex);
 
     // keep open a short while
+    // sleep(1);
+    send_interested(s);
+    sleep(1);
+    send_not_interested(s);
+    sleep(1);
+    send_choke(s);
+    sleep(1);
+    send_unchoke(s);
+    sleep(1);
+    send_keepalive(s);
     sleep(1);
     close(s);
     return 0;
@@ -534,6 +697,7 @@ int main(int argc, char **argv) {
         size_t L = strlen(peeridstr); if (L>20) L=20;
         memcpy(my_peerid, peeridstr, L);
     } else {
+        srand((unsigned)time(NULL) ^ (unsigned) getpid());
         gen_peer_id(my_peerid, "-HS0001-"); // default prefix
     }
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", my_peerid[i]); pidhex[40]=0;
@@ -562,7 +726,7 @@ int main(int argc, char **argv) {
             pthread_create(&thr[i], NULL, client_thread, a);
             pthread_detach(thr[i]);
         }
-        sleep(3);
+        sleep(4);
 
         // typedef struct { const char *cp; unsigned char ih[20]; unsigned char pid[20]; } cctx_t;
         // cctx_t *cctxs[N];
