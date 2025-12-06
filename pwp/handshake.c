@@ -36,6 +36,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "peer_wire.h"
+#include "storage.h"
 #include "bencode.h"   // update the path
 /* ---------------- helpers: readn/writen ---------------- */
 static ssize_t readn(int fd, void *buf, size_t n) {
@@ -66,6 +68,9 @@ static ssize_t writen(int fd, const void *buf, size_t n) {
     }
     return (ssize_t)n;
 }
+
+/* global storage backend (initialized from torrent info) */
+static storage_t STORAGE;
 
 /* ---------------- find the exact bencoded "info" slice in a .torrent file ----------------
    We must SHA256 the exact bencoded bytes for the "info" dictionary.
@@ -310,6 +315,17 @@ static int recv_handshake(int fd, unsigned char out_info_hash[20], unsigned char
     return 0;
 }
 
+/* helper: send HAVE (message id = 4) */
+static int send_have(int fd, uint32_t index) {
+    uint32_t be_len = htonl(1 + 4); /* id + 4-byte index */
+    unsigned char buf[9];
+    memcpy(buf, &be_len, 4);
+    buf[4] = 4; /* HAVE */
+    uint32_t be_index = htonl(index);
+    memcpy(buf + 5, &be_index, 4);
+    return writen(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf) ? 0 : -1;
+}
+
 /* ---------------- message framing and helpers ---------------- */
 
 static int send_keepalive(int fd){
@@ -329,14 +345,6 @@ static int send_unchoke(int fd){ return send_simple_msg(fd, 1); }
 static int send_interested(int fd){ return send_simple_msg(fd, 2); }
 static int send_not_interested(int fd){ return send_simple_msg(fd, 3); }
 // send have (id=4) with 4-byte piece index (b-endian)
-static int send_have(int fd, uint32_t index) {
-    uint32_t len = htonl(5);
-    unsigned char buf[9];
-    memcpy(buf, &len, 4);
-    buf[4] = 4;
-    memcpy(buf + 5, &index, 4);
-    return writen(fd, buf, 9) == 9 ? 0 : -1;
-}
 //send bitfield (id=5) with payload bytes
 static int send_bitfiled(int fd, const unsigned char *payload, size_t payload_len) {
     if (payload_len > 0x7fffffff) return -1;
@@ -367,10 +375,11 @@ typedef struct {
     socklen_t cliaddr_len;
     unsigned char info_hash[20];
     unsigned char server_peer_id[20];
+    storage_t *storage;
 } server_conn_ctx_t;
 
 // handle messages after handshake
-static void handle_incoming_message(int fd, unsigned char msg_id, uint32_t payload_len, unsigned char *peerid) {
+static void handle_incoming_message(int fd, unsigned char msg_id, uint32_t payload_len, unsigned char *peerid, storage_t *storage) {
     (void)fd;
     // payload_len is length excluding message id; caller must read payload or skip.
     switch (msg_id) {
@@ -391,12 +400,7 @@ static void handle_incoming_message(int fd, unsigned char msg_id, uint32_t paylo
             fprintf(stderr, "[server] got NOT_INTERESTED from peer\n");
             break;
         case 4: { // have: payload 4 bytes piece index
-            if (payload_len != 4) {
-                fprintf(stderr, "[server] HAVE with wrong payload len %u\n", payload_len);
-                break;
-            }
-            // reading handled by caller
-            fprintf(stderr, "[server] got HAVE\n");
+            fprintf(stderr, "[server] got HAVE (len=%u)\n", payload_len);
             break;
         }
         case 5: // bitfield
@@ -406,6 +410,8 @@ static void handle_incoming_message(int fd, unsigned char msg_id, uint32_t paylo
             fprintf(stderr, "[server] got UNKNOWN id=%u len=%u\n", msg_id, payload_len);
     }
 }
+
+
 
 static void *server_conn_thread(void *arg) {
     server_conn_ctx_t *ctx = arg;
@@ -470,24 +476,49 @@ static void *server_conn_thread(void *arg) {
         unsigned char id;
         if (readn(fd, &id, 1) != 1) break;
         uint32_t payload_len = len - 1;
-        if (id == 4 && payload_len == 4) {
-            unsigned char idxbuf[4];
-            if (readn(fd, idxbuf, 4) != 4) break;
-            uint32_t idx = ntohl(*(uint32_t *)idxbuf);
-            fprintf(stderr, "[server] HAVE got HAVE index=%u\n", idx);
-            handle_incoming_message(fd, id, payload_len, remote_peerid);
-        } else if (id == 5) {
+        if (id == 6) { /* REQUEST */
+            unsigned char reqbuf[12];
+            if (readn(fd, reqbuf, 12) != 12) break;
+            uint32_t index = ntohl(*(uint32_t*)(reqbuf + 0));
+            uint32_t begin = ntohl(*(uint32_t*)(reqbuf + 4));
+            uint32_t rlen = ntohl(*(uint32_t*)(reqbuf + 8));
+            fprintf(stderr, "[server] got REQUEST idx=%u begin=%u len=%u\n", index, begin, rlen);
+            handle_request_msg(fd, remote_peerid, index, begin, rlen, ctx->storage);
+        } else if (id == 7) { /* PIECE */
+            unsigned char hdr[8];
+            if (readn(fd, hdr, 8) != 8) break;
+            uint32_t index = ntohl(*(uint32_t*)(hdr + 0));
+            uint32_t begin = ntohl(*(uint32_t*)(hdr + 4));
+            uint32_t blklen = payload_len - 8;
+            unsigned char *blk = malloc(blklen ? blklen : 1);
+            if (!blk) { skip_payload(fd, blklen); continue; }
+            if (readn(fd, blk, blklen) != (ssize_t)blklen) { free(blk); break; }
+            fprintf(stderr, "[server] got PIECE idx=%u begin=%u len=%u\n", index, begin, blklen);
+            int rc = handle_piece_msg(fd, remote_peerid, index, begin, blk, blklen, ctx->storage);
+            free(blk);
+            if (rc == 0 && storage_is_piece_complete(ctx->storage, index)) {
+                /* announce HAVE back to peer */
+                send_have(fd, index);
+            }
+        } else if (id == 8) { /* CANCEL */
+            unsigned char cbuf[12];
+            if (readn(fd, cbuf, 12) != 12) break;
+            uint32_t index = ntohl(*(uint32_t*)(cbuf + 0));
+            uint32_t begin = ntohl(*(uint32_t*)(cbuf + 4));
+            uint32_t rlen = ntohl(*(uint32_t*)(cbuf + 8));
+            fprintf(stderr, "[server] got CANCEL idx=%u begin=%u len=%u\n", index, begin, rlen);
+            handle_cancel_msg(fd, remote_peerid, index, begin, rlen, ctx->storage);
+        } else if (id == 5) { /* BITFIELD */
             unsigned char *bf = malloc(payload_len ? payload_len : 1);
             if (!bf) { skip_payload(fd, payload_len); continue; }
             if (readn(fd, bf, payload_len) != (ssize_t)payload_len) { free(bf); break; }
             fprintf(stderr, "[server] got BITFIELD len=%u\n", payload_len);
-            handle_incoming_message(fd, id, payload_len, remote_peerid);
+            handle_incoming_message(fd, id, payload_len, remote_peerid, ctx->storage);
             free(bf);
         } else {
-            if (payload_len) {
-                skip_payload(fd, payload_len);
-            }
-            handle_incoming_message(fd, id, payload_len, remote_peerid);
+            /* simple control messages or unknown: read and dispatch */
+            if (payload_len) skip_payload(fd, payload_len);
+            handle_incoming_message(fd, id, payload_len, remote_peerid, ctx->storage);
         }
     }
     fprintf(stderr, "[server] connection closed for peer %s\n", pidhex);
@@ -525,6 +556,7 @@ static int server_run(const char *port_s, const unsigned char info_hash[20], con
         ctx->cliaddr_len = clilen;
         memcpy(ctx->info_hash, info_hash, 20);
         memcpy(ctx->server_peer_id, server_peer_id, 20);
+        ctx->storage = &STORAGE;
         pthread_t tid;
         pthread_create(&tid, NULL, server_conn_thread, ctx);
         pthread_detach(tid);
@@ -593,8 +625,6 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", remote_peerid[i]); pidhex[40]=0;
     fprintf(stderr, "[client] handshake success to %s:%u peerid=%s\n", ipbuf, portn, pidhex);
 
-    // keep open a short while
-    // sleep(1);
     send_interested(s);
     sleep(1);
     send_not_interested(s);
@@ -605,6 +635,46 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
     sleep(1);
     send_keepalive(s);
     sleep(1);
+
+    /* For testing piece exchange: if storage indicates piece 0 not present, request block 0 */
+    if (STORAGE.num_pieces > 0 && !storage_is_piece_complete(&STORAGE, 0)) {
+        uint32_t want = storage_piece_size(&STORAGE, 0);
+        if (want > 16384) want = 16384;
+        fprintf(stderr, "[client] requesting piece 0 begin=0 len=%u\n", want);
+        send_request_msg(s, 0, 0, want);
+
+        while (1) {
+            uint32_t len_be2;
+            if (readn(s, &len_be2, 4) != 4) break;
+            uint32_t len2 = ntohl(len_be2);
+            if (len2 == 0) { fprintf(stderr, "[client] keepalive\n"); continue; }
+            unsigned char id2;
+            if (readn(s, &id2, 1) != 1) break;
+            if (id2 == 7) { /* piece */
+                unsigned char hdr[8];
+                if (readn(s, hdr, 8) != 8) break;
+                uint32_t pidx = ntohl(*(uint32_t*)(hdr+0));
+                uint32_t pbegin = ntohl(*(uint32_t*)(hdr+4));
+                uint32_t blklen = len2 - 9;
+                unsigned char *blk = malloc(blklen ? blklen : 1);
+                if (!blk) { skip_payload(s, blklen); break; }
+                if (readn(s, blk, blklen) != (ssize_t)blklen) { free(blk); break; }
+                fprintf(stderr, "[client] got PIECE idx=%u begin=%u len=%u\n", pidx, pbegin, blklen);
+                /* write block into local storage and verify */
+                int rc = handle_piece_msg(s, remote_peerid, pidx, pbegin, blk, blklen, &STORAGE);
+                free(blk);
+                if (rc == 0 && storage_is_piece_complete(&STORAGE, pidx)) {
+                    /* send HAVE to server */
+                    send_have(s, pidx);
+                }
+                break;
+            } else {
+                /* skip other messages for test */
+                if (len2 > 1) skip_payload(s, len2 - 1);
+            }
+        }
+    }
+ 
     close(s);
     return 0;
 }
