@@ -9,44 +9,31 @@
 
 /* send helpers */
 int send_request_msg(int fd, uint32_t index, uint32_t begin, uint32_t length) {
-    uint32_t payload_len = 1 + 4 + 4 + 4; // Length of ID + index + begin + length (13 bytes)
-    uint32_t total_msg_len_be = htonl(payload_len); // B-endian for total payload length
-    unsigned char buf[4 + payload_len]; // Total message size (4-byte length prefix + payload) = 17 bytes
-
-    memcpy(buf, &total_msg_len_be, 4); // Write the 4-byte length prefix
-    buf[4] = 6; // Message ID for REQUEST (1 byte)
-    uint32_t be_index = htonl(index);
-    uint32_t be_begin = htonl(begin);
-    uint32_t be_len = htonl(length);
-
-    memcpy(buf+5, &be_index, 4); // Copy index (4 bytes)
-    memcpy(buf+9, &be_begin, 4); // Copy begin (4 bytes)
-    memcpy(buf+13, &be_len, 4); // Copy length (4 bytes)
-
-    ssize_t w = write(fd, buf, sizeof(buf)); // sizeof(buf) is 17.
+    uint32_t len = htonl(1 + 4 + 4 + 4);
+    unsigned char buf[4 + len];
+    memcpy(buf, &len, 4);
+    buf[4] = 6;
+    uint32_t be_index = htonl(index), be_begin = htonl(begin), be_len = htonl(length);
+    memcpy(buf+5, &be_index, 4);
+    memcpy(buf+9, &be_begin, 4);
+    memcpy(buf+13, &be_len, 4);
+    ssize_t w = write(fd, buf, sizeof(buf));
     return (w == (ssize_t)sizeof(buf)) ? 0 : -1;
 }
 
 int send_cancel_msg(int fd, uint32_t index, uint32_t begin, uint32_t length) {
-    uint32_t payload_len = 1 + 4 + 4 + 4; // Length of ID + index + begin + length (13 bytes)
-    uint32_t total_msg_len_be = htonl(payload_len); // B-endian for total payload length
-    unsigned char buf[4 + payload_len]; // Total message size (4-byte length prefix + payload) = 17 bytes
-
-    memcpy(buf, &total_msg_len_be, 4); // Write the 4-byte length prefix
-    buf[4] = 8; // Message ID for CANCEL (1 byte)
-    uint32_t be_index = htonl(index);
-    uint32_t be_begin = htonl(begin);
-    uint32_t be_len = htonl(length);
-
-    memcpy(buf+5, &be_index, 4); // Copy index (4 bytes)
-    memcpy(buf+9, &be_begin, 4); // Copy begin (4 bytes)
-    memcpy(buf+13, &be_len, 4); // Copy length (4 bytes)
-
-    ssize_t w = write(fd, buf, sizeof(buf)); // sizeof(buf) is 17.
+    uint32_t len = htonl(1 + 4 + 4 + 4);
+    unsigned char buf[4 + len];
+    memcpy(buf, &len, 4);
+    buf[4] = 8;
+    uint32_t be_index = htonl(index), be_begin = htonl(begin), be_len = htonl(length);
+    memcpy(buf+5, &be_index, 4);
+    memcpy(buf+9, &be_begin, 4);
+    memcpy(buf+13, &be_len, 4);
+    ssize_t w = write(fd, buf, sizeof(buf));
     return (w == (ssize_t)sizeof(buf)) ? 0 : -1;
 }
 
-/* send piece: build length, id=7, index(4), begin(4), block */
 int send_piece_msg(int fd, uint32_t index, uint32_t begin, const void *block, uint32_t blocklen) {
     uint64_t totlen = 1 + 4 + 4 + blocklen;
     if (totlen > 0x7fffffff) return -1;
@@ -63,7 +50,6 @@ int send_piece_msg(int fd, uint32_t index, uint32_t begin, const void *block, ui
     return 0;
 }
 
-/* handle request: read requested block from storage and send piece */
 int handle_request_msg(int peer_fd, const unsigned char *peerid, uint32_t index, uint32_t begin, uint32_t length, storage_t *storage) {
     (void)peerid;
     if (!storage) return -1;
@@ -79,28 +65,25 @@ int handle_request_msg(int peer_fd, const unsigned char *peerid, uint32_t index,
         free(buf);
         return -1;
     }
-    // send piece
     if (send_piece_msg(peer_fd, index, begin, buf, length) != 0) {
         fprintf(stderr, "[peer_wire] failed send_piece\n");
         free(buf);
         return -1;
     }
-    fprintf(stderr, "[server] sending PIECE index=%u begin=%u len=%u\n", index, begin, length);
+    // fprintf(stderr, "[server] sending PIECE index=%u begin=%u len=%u\n", index, begin, length);
     free(buf);
     return 0;
 }
 
-/* handle incoming piece: write to disk via storage_write_block_and_check */
 int handle_piece_msg(int peer_fd, const unsigned char *peerid, uint32_t index, uint32_t begin, const unsigned char *data, uint32_t datalen, storage_t *storage) {
     (void)peer_fd; (void)peerid;
     if (!storage) return -1;
     int r = storage_write_block_and_check(storage, index, begin, data, datalen);
     if (r == 0) {
-        // piece verified or block written but may not complete entire piece. If piece complete, caller may query storage_is_piece_complete
-        fprintf(stderr, "[client] wrote piece %u OK\n", index);
+        // printf(stderr, "[client] wrote piece %u OK\n", index);
         if (storage_is_piece_complete(storage, index)) {
             fprintf(stderr, "[peer_wire] piece %u complete and verified\n", index);
-            fprintf(stderr, "[client] marking piece %u complete\n", index);
+            fprintf(stderr, "[client] making piece %u complete\n", index);
         } else {
             fprintf(stderr, "[peer_wire] wrote block for piece %u begin=%u len=%u\n", index, begin, datalen);
         }
@@ -116,7 +99,7 @@ int handle_piece_msg(int peer_fd, const unsigned char *peerid, uint32_t index, u
 
 int handle_cancel_msg(int peer_fd, const unsigned char *peerid, uint32_t index, uint32_t begin, uint32_t length, storage_t *storage) {
     (void)peer_fd; (void)peerid; (void)index; (void)begin; (void)length; (void)storage;
-    // For simplicity we don't implement a pending-requests queue. Cancel is acknowledged by silence.
+    // Now for simplicity, pending-requests queue is not implemented. cancel is acked by silence.
     fprintf(stderr, "[peer_wire] cancel received (ignored) index=%u\n", index);
     return 0;
 }
