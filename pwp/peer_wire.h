@@ -17,4 +17,4 @@ int send_request_msg(int fd, uint32_t index, uint32_t begin, uint32_t length);
 int send_piece_msg(int fd, uint32_t index, uint32_t begin, const void *block, uint32_t blocklen);
 int send_cancel_msg(int fd, uint32_t index, uint32_t begin, uint32_t length);
 
-#endif // PEER_WIRE_H
+#endif

@@ -62,4 +62,4 @@ uint32_t storage_piece_size(storage_t *s, uint32_t index);
 uint32_t storage_num_pieces(storage_t *s);
 uint32_t storage_piece_length(storage_t *s);
 
-#endif // STORAGE_H
+#endif
