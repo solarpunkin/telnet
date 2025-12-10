@@ -1,29 +1,10 @@
-// handshake.c
-// BitTorrent-style TCP handshake implementation (server + client) using SHA-256-on-info
-// and truncating to 20 bytes for the handshake info_hash.
-// Reuses existing bencode parser to locate the exact bencoded "info" slice.
-// Build: cc -O2 -std=c11 handshake.c bencode.c -o handshake -lcrypto -lpthread
-// Build command works: cc -O2 -std=c11 handshake.c bencode.c -o handshake 
-// -I/opt/homebrew/opt/openssl@3/include -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto -lpthread
-//
-// Usage:
-//   Server: ./handshake --mode server --port 6881 --torrent my.torrent --peer-id "-HS0001-1234567890"
-//   Client: ./handshake --mode client --connect 127.0.0.1:6881 --torrent my.torrent
-//
-// The server accepts TCP connections and performs the standard peer handshake:
-//  <pstrlen><pstr><reserved><info_hash><peer_id>
-// Both sides send handshake; each validates info_hash matches the local torrent's info_hash.
-// After successful handshake, peers are registered in an in-memory peer manager.
-//
-// We compute SHA-256(info_bencoded) and truncate to 20 bytes
-
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -167,10 +148,13 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
 static int compute_info_hash_sha256_truncated(const unsigned char *buf, size_t start, size_t end, unsigned char out20[20]) {
     if (end <= start) return -1;
     unsigned char digest[32];
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, buf + start, end - start);
-    SHA256_Final(digest, &ctx);
+    unsigned int dlen;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, buf + start, end - start);
+    EVP_DigestFinal_ex(ctx, digest, &dlen);
+    EVP_MD_CTX_free(ctx);
     memcpy(out20, digest, 20); // truncation policy
     return 0;
 }
@@ -453,7 +437,6 @@ static void *server_conn_thread(void *arg) {
     }
     pm_add_or_update(&PM, remote_peerid, ipbuf, port);
 
-    // log success
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", remote_peerid[i]); pidhex[40]=0;
     fprintf(stderr, "[server] handshake success with %s:%u peerid=%s\n", ipbuf, port, pidhex);
 
@@ -475,8 +458,15 @@ static void *server_conn_thread(void *arg) {
         // read id
         unsigned char id;
         if (readn(fd, &id, 1) != 1) break;
-        uint32_t payload_len = len - 1;
-        if (id == 6) { /* REQUEST */
+        uint32_t payload_len = len - 1; // len is total payload length for message (excluding initial 4-byte length prefix)
+
+        if (id == 4) { /* HAVE */
+            unsigned char have_buf[4];
+            if (readn(fd, have_buf, 4) != 4) break; // Read 4-byte piece index
+            uint32_t piece_idx = ntohl(*(uint32_t*)have_buf);
+            fprintf(stderr, "[server] got HAVE %u\n", piece_idx); // CORRECTED
+        }
+        else if (id == 6) { /* REQUEST */
             unsigned char reqbuf[12];
             if (readn(fd, reqbuf, 12) != 12) break;
             uint32_t index = ntohl(*(uint32_t*)(reqbuf + 0));
@@ -625,27 +615,20 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", remote_peerid[i]); pidhex[40]=0;
     fprintf(stderr, "[client] handshake success to %s:%u peerid=%s\n", ipbuf, portn, pidhex);
 
-    send_interested(s);
-    sleep(1);
-    send_not_interested(s);
-    sleep(1);
-    send_choke(s);
-    sleep(1);
-    send_unchoke(s);
-    sleep(1);
-    send_keepalive(s);
-    sleep(1);
+    send_interested(s); // Send interested
+    // No sleep here. Immediately proceed to request piece.
 
     /* For testing piece exchange: if storage indicates piece 0 not present, request block 0 */
     if (STORAGE.num_pieces > 0 && !storage_is_piece_complete(&STORAGE, 0)) {
         uint32_t want = storage_piece_size(&STORAGE, 0);
         if (want > 16384) want = 16384;
         fprintf(stderr, "[client] requesting piece 0 begin=0 len=%u\n", want);
-        send_request_msg(s, 0, 0, want);
-
+	    send_request_msg(s, 0, 0, want);
+	    fprintf(stderr, "[DEBUG] entering piece request loop\n");
         while (1) {
             uint32_t len_be2;
-            if (readn(s, &len_be2, 4) != 4) break;
+            ssize_t r = readn(s, &len_be2, 4);
+            if (r != 4) break;
             uint32_t len2 = ntohl(len_be2);
             if (len2 == 0) { fprintf(stderr, "[client] keepalive\n"); continue; }
             unsigned char id2;
@@ -657,15 +640,20 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
                 uint32_t pbegin = ntohl(*(uint32_t*)(hdr+4));
                 uint32_t blklen = len2 - 9;
                 unsigned char *blk = malloc(blklen ? blklen : 1);
-                if (!blk) { skip_payload(s, blklen); break; }
+                if (!blk) { skip_payload(s, blklen); continue; }
                 if (readn(s, blk, blklen) != (ssize_t)blklen) { free(blk); break; }
                 fprintf(stderr, "[client] got PIECE idx=%u begin=%u len=%u\n", pidx, pbegin, blklen);
                 /* write block into local storage and verify */
                 int rc = handle_piece_msg(s, remote_peerid, pidx, pbegin, blk, blklen, &STORAGE);
                 free(blk);
                 if (rc == 0 && storage_is_piece_complete(&STORAGE, pidx)) {
-                    /* send HAVE to server */
+                    /* send HAVE back to server */
                     send_have(s, pidx);
+                    fprintf(stderr, "[client] sending HAVE %u\n", pidx);
+                    // Check if all pieces downloaded - simple check for 1 piece
+                    if (STORAGE.num_pieces == 1 && storage_is_piece_complete(&STORAGE, 0)) { // For multiple pieces, would iterate over have_bits
+                        fprintf(stderr, "[client] all requested pieces downloaded\n");
+                    }
                 }
                 break;
             } else {
@@ -674,9 +662,23 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
             }
         }
     }
- 
-    close(s);
-    return 0;
+    // Now, after the piece exchange loop (or if it wasn't entered), send other messages.
+    send_not_interested(s);
+    sleep(1);
+    send_choke(s);
+    sleep(1);
+    send_unchoke(s);
+    sleep(1);
+    send_keepalive(s);
+        sleep(1);
+    
+            fprintf(stderr, "[client] connection closed\n");
+    
+            fflush(stderr); // ADD THIS
+    
+            close(s);
+    
+            return 0;
 }
 
 /* ---------------- utility: peer_id generator ---------------- */
@@ -751,6 +753,15 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "info slice located at [%zu..%zu) size=%zu\n", istart, iend, iend-istart);
 
+    fprintf(stderr, "[DEBUG] Before storage_init_from_info\n");
+    if (storage_init_from_info(&STORAGE, buf + istart, iend - istart, torrent) < 0) {
+        fprintf(stderr, "[fatal] storage init failed\n");
+        exit(1);
+    }
+    fprintf(stderr, "[DEBUG] After storage_init_from_info\n");
+
+    fprintf(stderr, "[storage] init: num_pieces=%u piece_len=%u total=%llu\n", STORAGE.num_pieces, STORAGE.piece_len, (unsigned long long)STORAGE.total_length);
+
     // compute sha256 truncated to 20 bytes
     unsigned char info_hash[20];
     if (compute_info_hash_sha256_truncated(buf, istart, iend, info_hash) != 0) {
@@ -797,31 +808,6 @@ int main(int argc, char **argv) {
             pthread_detach(thr[i]);
         }
         sleep(4);
-
-        // typedef struct { const char *cp; unsigned char ih[20]; unsigned char pid[20]; } cctx_t;
-        // cctx_t *cctxs[N];
-        // for (int i=0;i<N;i++){
-        //     cctxs[i] = malloc(sizeof(cctx_t));
-        //     cctxs[i]->cp = connect;
-        //     memcpy(cctxs[i]->ih, info_hash, 20);
-        //     // create different peer ids for each client
-        //     unsigned char pid[20];
-        //     gen_peer_id(pid, "-CL0001-");
-        //     memcpy(cctxs[i]->pid, pid, 20);
-        //     pthread_create(&thr[i], NULL, (void*(*)(void*)) (void*) (^(void *arg)->void* { // workaround not allowed: we will use a wrapper below
-        //         return NULL;
-        //     }), NULL);
-        // }
-        // // The above hack is messy in C - instead we will spawn client runs sequentially in threads with a simple wrapper.
-        // // Clean approach: create a small helper function.
-        // for (int i=0;i<N;i++) pthread_detach(pthread_create_wrapper((void*)connect, info_hash, cctxs[i]->pid)); 
-        // // But we can't do that - C doesn't support easy lambda here.
-        // // Simpler: run clients sequentially (less concurrency) and show multiple handshakes.
-        // for (int i=0;i<3;i++) {
-        //     unsigned char pid[20];
-        //     gen_peer_id(pid, "-CL0001-");
-        //     client_run(connect, info_hash, pid);
-        // }
     } else {
         fprintf(stderr, "unknown mode\n");
         free(buf);
