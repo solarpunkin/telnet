@@ -7,14 +7,14 @@
 #define MAX_TORRENT_NAME 256
 
 typedef struct {
-    char name[MAX_TORRENT_NAME];   // torrent name / id
-    uint64_t total_length;         // total bytes of file (single-file mode)
-    uint32_t piece_len;           // piece length (bytes)
+    char name[MAX_TORRENT_NAME];   
+    uint64_t total_length;         
+    uint32_t piece_len;           
     uint32_t num_pieces;
-    unsigned char *pieces_hashes; // pointer to raw piece-hash bytes (num_pieces * hash_len)
-    size_t piece_hash_len;        // 32 for SHA-256, 20 for legacy SHA-1
-    char storage_path[512];       // path to the data file
-    unsigned char *have_bits;     // bitfield (num_pieces bits) 
+    unsigned char *pieces_hashes; 
+    size_t piece_hash_len;        
+    char storage_path[512];       
+    unsigned char *have_bits;     
 } storage_t;
 
 /* initialize storage based on torrent metadata buffer.
