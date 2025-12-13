@@ -14,7 +14,12 @@ typedef struct {
     unsigned char *pieces_hashes; 
     size_t piece_hash_len;        
     char storage_path[512];       
-    unsigned char *have_bits;     
+    unsigned char *have_bits; 
+    /* block level tracking */
+    uint32_t block_size;
+    uint32_t *block_off;
+    unsigned char *block_bits;
+    size_t block_bits_bytes;
 } storage_t;
 
 /* initialize storage based on torrent metadata buffer.
