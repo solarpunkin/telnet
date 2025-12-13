@@ -197,6 +197,73 @@ typedef struct {
 
 static peer_manager_t PM;
 
+typedef struct conn_entry {
+    int fd;
+    unsigned char peer_id[20];
+    struct conn_entry *next;
+} conn_entry_t;
+
+static conn_entry_t *CONNS = NULL;
+static pthread_mutex_t CONNS_LOCK = PTHREAD_MUTEX_INITIALIZER;
+static void conns_add(int fd, const unsigned char peer_id[20]) {
+    conn_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) return;
+    e->fd = fd;
+    memcpy(e->peer_id, peer_id, 20);
+
+    pthread_mutex_lock(&CONNS_LOCK);
+    e->next = CONNS;
+    CONNS = e;
+    pthread_mutex_unlock(&CONNS_LOCK);
+}
+static void conns_remove(int fd) {
+    pthread_mutex_lock(&CONNS_LOCK);
+    conn_entry_t **pp = &CONNS;
+    while (*pp) {
+        if ((*pp)->fd == fd) {
+            conn_entry_t *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&CONNS_LOCK);
+}
+/* helper: send HAVE (message id = 4) */
+static int send_have(int fd, uint32_t index) {
+    uint32_t be_len = htonl(1 + 4); /* id + 4-byte index */
+    unsigned char buf[9];
+    memcpy(buf, &be_len, 4);
+    buf[4] = 4; /* HAVE */
+    uint32_t be_index = htonl(index);
+    memcpy(buf + 5, &be_index, 4);
+    return writen(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf) ? 0 : -1;
+}
+
+static void conns_broadcast_have(uint32_t piece_index) {
+    int *fds = NULL;
+    size_t n = 0;
+
+    pthread_mutex_lock(&CONNS_LOCK);
+    for (conn_entry_t *e = CONNS; e; e = e->next) n++;
+    fds = malloc(n * sizeof(int));
+    if (fds) {
+        size_t i = 0;
+        for (conn_entry_t *e = CONNS; e && i < n; e = e->next) fds[i++] = e->fd;
+        n = i;
+    } else {
+        n = 0;
+    }
+    pthread_mutex_unlock(&CONNS_LOCK);
+
+    for (size_t i = 0; i < n; i++) {
+        /* ignore errors */
+        send_have(fds[i], piece_index);
+    }
+    free(fds);
+}
+
 static void pm_init(peer_manager_t *pm) {
     pm->head = NULL;
     pthread_mutex_init(&pm->lock, NULL);
@@ -316,17 +383,6 @@ static int recv_handshake(int fd, unsigned char out_info_hash[20], unsigned char
     if (readn(fd, out_info_hash, HANDSHAKE_INFOHASH_LEN) != HANDSHAKE_INFOHASH_LEN) return -1;
     if (readn(fd, out_peer_id, HANDSHAKE_PEERID_LEN) != HANDSHAKE_PEERID_LEN) return -1;
     return 0;
-}
-
-/* helper: send HAVE (message id = 4) */
-static int send_have(int fd, uint32_t index) {
-    uint32_t be_len = htonl(1 + 4); /* id + 4-byte index */
-    unsigned char buf[9];
-    memcpy(buf, &be_len, 4);
-    buf[4] = 4; /* HAVE */
-    uint32_t be_index = htonl(index);
-    memcpy(buf + 5, &be_index, 4);
-    return writen(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf) ? 0 : -1;
 }
 
 /* ---------------- message framing and helpers ---------------- */
@@ -458,6 +514,7 @@ static void *server_conn_thread(void *arg) {
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", remote_peerid[i]); pidhex[40]=0;
     fprintf(stderr, "[server] handshake success with %s:%u peerid=%s\n", ipbuf, port, pidhex);
 
+    conns_add(fd, remote_peerid);
     // keep the connection open for future messages (not implemented here).
     // For demo, sleep a little and close.
     // sleep(1);
@@ -480,22 +537,26 @@ static void *server_conn_thread(void *arg) {
         if (id == 4) { /* HAVE */
             unsigned char have_buf[4];
             if (readn(fd, have_buf, 4) != 4) break;
-            uint32_t piece_idx = ntohl(*(uint32_t*)have_buf);
+            uint32_t piece_idx;
+            memcpy(&piece_idx, have_buf, 4);
+            piece_idx = ntohl(piece_idx);
             fprintf(stderr, "[server] got HAVE %u\n", piece_idx); 
         }
         if (id == 6) { /* REQUEST */
             unsigned char reqbuf[12];
             if (readn(fd, reqbuf, 12) != 12) break;
-            uint32_t index = ntohl(*(uint32_t*)(reqbuf + 0));
-            uint32_t begin = ntohl(*(uint32_t*)(reqbuf + 4));
-            uint32_t rlen = ntohl(*(uint32_t*)(reqbuf + 8));
+            uint32_t index, begin, rlen;
+            memcpy(&index, reqbuf + 0, 4); index = ntohl(index);
+            memcpy(&begin, reqbuf + 4, 4); begin = ntohl(begin);
+            memcpy(&rlen, reqbuf + 8, 4); rlen = ntohl(rlen);
             fprintf(stderr, "[server] got REQUEST idx=%u begin=%u len=%u\n", index, begin, rlen);
             handle_request_msg(fd, remote_peerid, index, begin, rlen, ctx->storage);
         } else if (id == 7) { /* PIECE */
             unsigned char hdr[8];
             if (readn(fd, hdr, 8) != 8) break;
-            uint32_t index = ntohl(*(uint32_t*)(hdr + 0));
-            uint32_t begin = ntohl(*(uint32_t*)(hdr + 4));
+            uint32_t index, begin;
+            memcpy(&index, hdr + 0, 4); index = ntohl(index);
+            memcpy(&begin, hdr + 4, 4); begin = ntohl(begin);
             uint32_t blklen = payload_len - 8;
             unsigned char *blk = malloc(blklen ? blklen : 1);
             if (!blk) { skip_payload(fd, blklen); continue; }
@@ -504,15 +565,16 @@ static void *server_conn_thread(void *arg) {
             int rc = handle_piece_msg(fd, remote_peerid, index, begin, blk, blklen, ctx->storage);
             free(blk);
             if (rc == 0 && storage_is_piece_complete(ctx->storage, index)) {
-                /* announce HAVE back to peer */
-                send_have(fd, index);
+                /* broadcast HAVE to all peers */
+                conns_broadcast_have(index);
             }
         } else if (id == 8) { /* CANCEL */
             unsigned char cbuf[12];
             if (readn(fd, cbuf, 12) != 12) break;
-            uint32_t index = ntohl(*(uint32_t*)(cbuf + 0));
-            uint32_t begin = ntohl(*(uint32_t*)(cbuf + 4));
-            uint32_t rlen = ntohl(*(uint32_t*)(cbuf + 8));
+            uint32_t index, begin, rlen;
+            memcpy(&index, cbuf + 0, 4); index = ntohl(index);
+            memcpy(&begin, cbuf + 4, 4); begin = ntohl(begin);
+            memcpy(&rlen, cbuf + 8, 4); rlen = ntohl(rlen);
             fprintf(stderr, "[server] got CANCEL idx=%u begin=%u len=%u\n", index, begin, rlen);
             handle_cancel_msg(fd, remote_peerid, index, begin, rlen, ctx->storage);
         } else if (id == 5) { /* BITFIELD */
@@ -529,6 +591,7 @@ static void *server_conn_thread(void *arg) {
         }
     }
     fprintf(stderr, "[server] connection closed for peer %s\n", pidhex);
+    conns_remove(fd);
     close(fd);
     free(ctx);
     return NULL;
@@ -628,7 +691,7 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
         portn = ntohs(a->sin6_port);
     }
     pm_add_or_update(&PM, remote_peerid, ipbuf, portn);
-
+    conns_add(s, remote_peerid);
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", remote_peerid[i]); pidhex[40]=0;
     fprintf(stderr, "[client] handshake success to %s:%u peerid=%s\n", ipbuf, portn, pidhex);
 
@@ -652,8 +715,9 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
             if (id2 == 7) { /* piece */
                 unsigned char hdr[8];
                 if (readn(s, hdr, 8) != 8) break;
-                uint32_t pidx = ntohl(*(uint32_t*)(hdr+0));
-                uint32_t pbegin = ntohl(*(uint32_t*)(hdr+4));
+                uint32_t pidx, pbegin;
+                memcpy(&pidx, hdr + 0, 4); pidx = ntohl(pidx);
+                memcpy(&pbegin, hdr + 4, 4); pbegin = ntohl(pbegin);
                 uint32_t blklen = len2 - 9;
                 unsigned char *blk = malloc(blklen ? blklen : 1);
                 if (!blk) { skip_payload(s, blklen); continue; }
@@ -663,8 +727,8 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
                 int rc = handle_piece_msg(s, remote_peerid, pidx, pbegin, blk, blklen, &STORAGE);
                 free(blk);
                 if (rc == 0 && storage_is_piece_complete(&STORAGE, pidx)) {
-                    /* send HAVE back to server */
-                    send_have(s, pidx);
+                    /* broadcast HAVE to all peers */
+                    conns_broadcast_have(pidx);
                     fprintf(stderr, "[client] sending HAVE %u\n", pidx);
                     // check if all pieces downloaded - here check for 1 piece
                     if (STORAGE.num_pieces == 1 && storage_is_piece_complete(&STORAGE, 0)) { 
@@ -689,6 +753,7 @@ static int client_run(const char *hostport, const unsigned char info_hash[20], c
     sleep(1);
     fprintf(stderr, "[client] connection closed\n");
     fflush(stderr); // flush baby
+    conns_remove(s);
     close(s); return 0;
 }
 
