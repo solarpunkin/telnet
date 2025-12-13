@@ -18,8 +18,7 @@ typedef struct bencode_frame_t {
     int negative;       /* added for negative ints */
     char *strval;
     size_t strlen, strcap;
-    char *key;
-    size_t keycap;
+    int dict_expect_key; // 1 if next element is key, 0 if value
 } bencode_frame_t;
 
 typedef struct bencode_callbacks_t {
@@ -41,6 +40,6 @@ typedef struct bencode_t {
 
 bencode_t *bencode_new(size_t nframes, bencode_callbacks_t *cbs, void *u);
 void bencode_free(bencode_t *me);
-int bencode_dispatch_from_buffer(bencode_t *me, const void *buf, size_t len);
+int bencode_dispatch_from_buffer(bencode_t *me, const void *buf, size_t len); // 1 on success, 0 on parse error
 
 #endif
