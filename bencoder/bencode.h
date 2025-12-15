@@ -19,6 +19,7 @@ typedef struct bencode_frame_t {
     char *strval;
     size_t strlen, strcap;
     int dict_expect_key; // 1 if next element is key, 0 if value
+    int digits_count;
 } bencode_frame_t;
 
 typedef struct bencode_callbacks_t {
