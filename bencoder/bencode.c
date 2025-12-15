@@ -175,8 +175,10 @@ int bencode_dispatch_from_buffer(bencode_t *me,
 
             bencode_frame_t *p = parent(me);
             if (p && p->type == BENCODE_DICT && p->dict_expect_key == 1) {
-                if (!(c>= '0' && c <= '9')) 
-                BENCODE_FAIL("dict key must be a string");
+                if (!(c>= '0' && c <= '9')) {
+                    fprintf(stderr, "bencode error: dict key must be a string (got char %d '%c')\n", c, c);
+                    return 0;
+                }
             }
             if (c == 'd') {
                 f->type = BENCODE_DICT;
@@ -222,8 +224,11 @@ int bencode_dispatch_from_buffer(bencode_t *me,
                 dict_value_completed(me);
             }
             else {
+                if (f->digits_count > 0 && f->intval == 0) BENCODE_FAIL("leading zero");
+                if (f->digits_count == 0 && c == '0' && f->negative) BENCODE_FAIL("negative zero");
                 if (__parse_digit(f, (char)c) != 0)
                 BENCODE_FAIL("bad int digit");
+                f->digits_count++;
             }
             break;
         }
@@ -238,6 +243,7 @@ int bencode_dispatch_from_buffer(bencode_t *me,
                 f->strlen = 0;
 
                 size_t want = (size_t)f->intval;
+                if (want > 100 * 1024 * 1024) BENCODE_FAIL("string too long");
                 f->strcap = want + 1;
                 f->strval = malloc(f->strcap);
                 if (!f->strval) BENCODE_FAIL("malloc failed");
@@ -294,4 +300,5 @@ int bencode_dispatch_from_buffer(bencode_t *me,
         BENCODE_FAIL("incomplete bencode (unterminated container?)");    //// !!!!
     }
     return 1;
+
 }
