@@ -73,7 +73,7 @@ static ssize_t writen(int fd, const void *buf, size_t n) {
 static storage_t STORAGE;
 
 /* ---------------- find the exact bencoded "info" slice in a .torrent file ----------------
-   We must SHA256 the exact bencoded bytes for the "info" dictionary.
+   We must SHA256 the exact bencoded bytes for the "info" dictionary. Input is a bencoded torrent metadata from which info dictionary is extracted.
    Approach: find the substring "4:info" and then parse the bencoded value that follows
    by walking the structure (handling strings, ints, lists, dicts) until it's balanced.
 */
@@ -83,11 +83,11 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
     size_t nlen = strlen(needle);
     for (size_t i = 0; i + nlen <= len; ++i) {
         if (memcmp(buf + i, needle, nlen) == 0) {
-            // value starts at i + nlen
+            // initialize value pos to i + nlen
             size_t pos = i + nlen;
             if (pos >= len) return -1;
             // value must be a bencoded value; parse it and find end pos (pos..end-1)
-            // We'll implement a stackless walker:
+            // stackless walker to find end of info dictionary
             size_t p = pos;
             int depth = 0;
             bool started = false;
@@ -96,7 +96,7 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
                 if (!started) {
                     // first token must start the info value
                     if (c == 'd' || c == 'l') { depth = 1; started = true; p++; continue; }
-                    else if (c == 'i') { // integer: read until 'e'
+                    else if (c == 'i') { // integer: read until 'e' and save start and end idx of integer
                         size_t q = p+1;
                         while (q < len && buf[q] != 'e') q++;
                         if (q >= len) return -1;
@@ -108,7 +108,7 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
                         size_t q = p;
                         while (q < len && buf[q] != ':') q++;
                         if (q >= len) return -1;
-                        // parse len
+                        // parse len and save start and end idx of string
                         char tmp[32]; size_t m = q - p;
                         if (m >= sizeof(tmp)) return -1;
                         memcpy(tmp, buf + p, m); tmp[m] = 0;
@@ -122,7 +122,7 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
                         return -1;
                     }
                 } else {
-                    // We are inside a list/dict; need to walk tokens until depth==0
+                    // We are inside a list/dict; need to walk until depth==0
                     if (c == 'd' || c == 'l') { depth++; p++; continue; }
                     else if (c == 'e') {
                         depth--; p++;
@@ -140,7 +140,7 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
                         p = q+1;
                         continue;
                     } else if (c >= '0' && c <= '9') {
-                        // string: parse len and skip
+                        // string: parse len and skip bytes
                         size_t q = p;
                         while (q < len && buf[q] != ':') q++;
                         if (q >= len) return -1;
@@ -163,7 +163,7 @@ static int find_info_slice(const unsigned char *buf, size_t len, size_t *out_sta
     return -1;
 }
 
-/* compute SHA256 over a buffer slice; output first 20 bytes truncated digest into out20 */
+/* compute SHA256; output first 20 bytes*/
 static int compute_info_hash_sha256_truncated(const unsigned char *buf, size_t start, size_t end, unsigned char out20[20]) {
     if (end <= start) return -1;
     unsigned char digest[32];
@@ -174,7 +174,7 @@ static int compute_info_hash_sha256_truncated(const unsigned char *buf, size_t s
     EVP_DigestUpdate(ctx, buf + start, end - start);
     EVP_DigestFinal_ex(ctx, digest, &dlen);
     EVP_MD_CTX_free(ctx);
-    memcpy(out20, digest, 20); // truncation policy
+    memcpy(out20, digest, 20); // change to 32 for full digest btorrent v3 
     return 0;
 }
 
@@ -281,7 +281,7 @@ static void pm_add_or_update(peer_manager_t *pm, const unsigned char peer_id[20]
         }
         p = p->next;
     }
-    // add
+    // add if not present already
     peer_entry_t *n = calloc(1, sizeof(peer_entry_t));
     memcpy(n->peer_id, peer_id, 20);
     strncpy(n->ip, ip, sizeof(n->ip)-1);
@@ -292,6 +292,7 @@ static void pm_add_or_update(peer_manager_t *pm, const unsigned char peer_id[20]
     n->next = pm->head;
     pm->head = n;
     pthread_mutex_unlock(&pm->lock);
+    // hex encode peer id
     char pidhex[41]; for (int i=0;i<20;i++) sprintf(pidhex+2*i, "%02x", n->peer_id[i]); pidhex[40]=0;
     fprintf(stderr, "[PM] added peer %s:%u id=%s\n", n->ip, n->port, pidhex);
 }
@@ -343,7 +344,7 @@ static void pm_log_all(peer_manager_t *pm) {
    Handshake layout:
    <pstrlen><pstr><reserved(8)><info_hash(20)><peer_id(20)>
    pstrlen is a single byte length of pstr.
-   pstr is typically "BitTorrent protocol" or a custom string.
+   pstr is "BitTorrent protocol" here.
 */
 
 #define HANDSHAKE_PSTR "BitTorrent protocol"
@@ -546,7 +547,7 @@ static void *server_conn_thread(void *arg) {
             unsigned char reqbuf[12];
             if (readn(fd, reqbuf, 12) != 12) break;
             uint32_t index, begin, rlen;
-            memcpy(&index, reqbuf + 0, 4); index = ntohl(index);
+            memcpy(&index, reqbuf, 4); index = ntohl(index);
             memcpy(&begin, reqbuf + 4, 4); begin = ntohl(begin);
             memcpy(&rlen, reqbuf + 8, 4); rlen = ntohl(rlen);
             fprintf(stderr, "[server] got REQUEST idx=%u begin=%u len=%u\n", index, begin, rlen);
@@ -555,10 +556,11 @@ static void *server_conn_thread(void *arg) {
             unsigned char hdr[8];
             if (readn(fd, hdr, 8) != 8) break;
             uint32_t index, begin;
-            memcpy(&index, hdr + 0, 4); index = ntohl(index);
+            memcpy(&index, hdr, 4); index = ntohl(index);
             memcpy(&begin, hdr + 4, 4); begin = ntohl(begin);
             uint32_t blklen = payload_len - 8;
             unsigned char *blk = malloc(blklen ? blklen : 1);
+            // skip payload if malloc fails
             if (!blk) { skip_payload(fd, blklen); continue; }
             if (readn(fd, blk, blklen) != (ssize_t)blklen) { free(blk); break; }
             fprintf(stderr, "[server] got PIECE idx=%u begin=%u len=%u\n", index, begin, blklen);
@@ -572,7 +574,7 @@ static void *server_conn_thread(void *arg) {
             unsigned char cbuf[12];
             if (readn(fd, cbuf, 12) != 12) break;
             uint32_t index, begin, rlen;
-            memcpy(&index, cbuf + 0, 4); index = ntohl(index);
+            memcpy(&index, cbuf, 4); index = ntohl(index);
             memcpy(&begin, cbuf + 4, 4); begin = ntohl(begin);
             memcpy(&rlen, cbuf + 8, 4); rlen = ntohl(rlen);
             fprintf(stderr, "[server] got CANCEL idx=%u begin=%u len=%u\n", index, begin, rlen);
@@ -882,31 +884,6 @@ int main(int argc, char **argv) {
             pthread_detach(thr[i]);
         }
         sleep(4);
-
-        // typedef struct { const char *cp; unsigned char ih[20]; unsigned char pid[20]; } cctx_t;
-        // cctx_t *cctxs[N];
-        // for (int i=0;i<N;i++){
-        //     cctxs[i] = malloc(sizeof(cctx_t));
-        //     cctxs[i]->cp = connect;
-        //     memcpy(cctxs[i]->ih, info_hash, 20);
-        //     // create different peer ids for each client
-        //     unsigned char pid[20];
-        //     gen_peer_id(pid, "-CL0001-");
-        //     memcpy(cctxs[i]->pid, pid, 20);
-        //     pthread_create(&thr[i], NULL, (void*(*)(void*)) (void*) (^(void *arg)->void* { // workaround not allowed: we will use a wrapper below
-        //         return NULL;
-        //     }), NULL);
-        // }
-        // // The above hack is messy in C - instead we will spawn client runs sequentially in threads with a simple wrapper.
-        // // Clean approach: create a small helper function.
-        // for (int i=0;i<N;i++) pthread_detach(pthread_create_wrapper((void*)connect, info_hash, cctxs[i]->pid)); 
-        // // But we can't do that - C doesn't support easy lambda here.
-        // // Simpler: run clients sequentially (less concurrency) and show multiple handshakes.
-        // for (int i=0;i<3;i++) {
-        //     unsigned char pid[20];
-        //     gen_peer_id(pid, "-CL0001-");
-        //     client_run(connect, info_hash, pid);
-        // }
     } else {
         fprintf(stderr, "unknown mode\n");
         free(buf);
