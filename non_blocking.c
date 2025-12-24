@@ -17,7 +17,6 @@
 #define MAX_NAME_LEN 32
 #define MAX_CLIENTS 10
 
-// struct to hold client info for chat server
 
 typedef struct {
     int socket;
@@ -36,19 +35,16 @@ void nonblocking_echo_server_select(){
     
     printf("Starting non-blocking TCP echo server (select) on port %d...\n", PORT);
 
-    //initialize client sockets array
     for(int i=0;i < MAX_CLIENTS; i++) {
         client_sockets[i] = -1;
     }
-
-    // Create socket
 
     if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
-    // Set socket options to reuse address
+    // reuse address
     int opt = 1;
     if((setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))<0) {
         perror("setsockopt failed");
@@ -60,7 +56,6 @@ void nonblocking_echo_server_select(){
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    // Bind and listen
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
@@ -121,7 +116,6 @@ void nonblocking_echo_server_select(){
             bytes_read = recv(client_fd, buffer, BUFFER_SIZE-1, 0);
             
             if (bytes_read <= 0) {
-                // Client disconnected or error
                 if (bytes_read == 0) {
                     printf("client on socket %d disconnected\n", client_fd);
 
